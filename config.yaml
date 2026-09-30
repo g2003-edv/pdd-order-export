@@ -1,0 +1,18 @@
+﻿dianshangrong:
+  base_url: https://inner.dianshangrong.com
+
+pinduoduo:
+  base_url: https://mms.pinduoduo.com
+  sms_timeout_seconds: 180
+  report_timeout_seconds: 300
+
+export:
+  start_date: ""
+  end_date: ""
+  output_dir: ""
+
+browser:
+  headless: false
+  profile_dir: .browser_profile
+
+shops: []

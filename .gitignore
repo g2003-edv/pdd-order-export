@@ -1,0 +1,30 @@
+# 运行数据与凭据（严禁入库）
+data/
+debug/
+*.log
+*.pid
+link_token.txt
+link_token.txt.*
+jobs.db
+secret.key
+flask_secret.key
+
+# 浏览器会话与下载产物
+.browser_profile/
+chrome_profile/
+profiles/
+downloads/
+*.csv
+*.xlsx
+
+# 体积过大的二进制（单独分发）
+cloudflared.exe
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 系统杂项
+Thumbs.db
+desktop.ini
