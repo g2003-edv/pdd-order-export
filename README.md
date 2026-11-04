@@ -52,7 +52,7 @@ pdd_export.py（Playwright）
 
 - Windows 10/11 或 Server，Python 3.10+（已在 PATH）
 - 已安装 Chrome（拼多多走真实浏览器 CDP 模式，风控最低）
-- 可访问 `inner.dianshangrong.com` 与 `mms.pinduoduo.com`
+- 可访问 `inner.example-dsr.com` 与 `mms.pinduoduo.com`
 
 ### 步骤
 

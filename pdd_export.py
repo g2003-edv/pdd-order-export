@@ -46,7 +46,7 @@ from playwright.sync_api import (
 BASE_DIR = Path(__file__).resolve().parent
 DEBUG_DIR = Path(os.environ.get("PDD_DEBUG_DIR") or (BASE_DIR / "debug")).resolve()
 
-DS_BASE = "https://inner.dianshangrong.com"
+DS_BASE = "https://inner.example-dsr.com"
 DS_MERCHANT_URL = DS_BASE + "/incoming-merchant/merchant"
 DS_SMS_URL = DS_BASE + "/incoming-phoneNumber/phonecardsmsrecord"
 PDD_BASE = "https://mms.pinduoduo.com"
