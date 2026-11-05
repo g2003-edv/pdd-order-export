@@ -6,7 +6,10 @@ rem ============================================================
 setlocal
 cd /d "%~dp0"
 
-set "PDD_WEB_DATA_DIR=E:\pdd_export_server\data"
+set "PDD_WEB_DATA_DIR=%~dp0data"
+rem 未设置 PDD_WEB_ACCESS_PASSWORD 时 webui.py 拒绝监听 0.0.0.0：
+rem   - 生产部署请设置访问密码；或
+rem   - token-only 部署显式设置 PDD_ALLOW_INSECURE_LOCAL=1（仅监听 127.0.0.1，隧道仍可接入）
 set "PDD_WEB_ACCESS_PASSWORD="
 set "PDD_WEB_HOST=0.0.0.0"
 set "PDD_OPEN_BROWSER=0"
@@ -19,9 +22,8 @@ set "PDD_WEB_LINK_TOKEN="
 if exist "%TOKEN_FILE%" for /f "usebackq delims=" %%t in ("%TOKEN_FILE%") do set "PDD_WEB_LINK_TOKEN=%%t"
 
 rem --- FAIL CLOSED: never start the UI without a token ---
-rem With an empty token webui.py disables the token gate entirely,
-rem and an empty PDD_WEB_ACCESS_PASSWORD disables the password gate,
-rem which would expose every endpoint to anyone who knows the URL.
+rem webui.py also fails closed when PDD_WEB_LINK_TOKEN is empty (all requests
+rem get 503), but starting such a process is pointless; stop before launch.
 if not defined PDD_WEB_LINK_TOKEN (
   echo [FATAL] link token is empty or "%TOKEN_FILE%" is missing.
   echo [FATAL] refusing to start: the web UI would have NO access control.

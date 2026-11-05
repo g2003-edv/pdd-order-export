@@ -26,7 +26,6 @@
 """
 
 import argparse
-import csv
 import datetime as dt
 import json
 import os
@@ -46,7 +45,8 @@ from playwright.sync_api import (
 BASE_DIR = Path(__file__).resolve().parent
 DEBUG_DIR = Path(os.environ.get("PDD_DEBUG_DIR") or (BASE_DIR / "debug")).resolve()
 
-DS_BASE = "https://inner.example-dsr.com"
+DEFAULT_DS_BASE = "https://inner.example-dsr.com"
+DS_BASE = DEFAULT_DS_BASE
 DS_MERCHANT_URL = DS_BASE + "/incoming-merchant/merchant"
 DS_SMS_URL = DS_BASE + "/incoming-phoneNumber/phonecardsmsrecord"
 PDD_BASE = "https://mms.pinduoduo.com"
@@ -59,6 +59,59 @@ MAX_BACKOFF_DAYS = 92  # 拼多多限制：可查时间窗 ≤ 3 个月（留 2 
 
 def log(msg: str) -> None:
     print(f"[{dt.datetime.now():%H:%M:%S}] {msg}", flush=True)
+
+
+_PHONE_RE = re.compile(r"(?<!\d)(1[3-9]\d)[ -]?(\d{4})[ -]?(\d{4})(?!\d)")
+
+
+def _mask_phone(value: str) -> str:
+    """手机号/账号脱敏：只保留前 3 位和后 4 位，短号整体打码。"""
+    value = (value or "").strip()
+    if len(value) <= 7:
+        return "*" * len(value)
+    return f"{value[:3]}****{value[-4:]}"
+
+
+def _mask_code(value: str) -> str:
+    """验证码脱敏：只保留前 2 位。"""
+    value = (value or "").strip()
+    return value[:2] + "**" if value else "**"
+
+
+def _redact_text(value: str, limit: int | None = None) -> str:
+    """日志文本脱敏：遮住其中的手机号，避免页面片段/账号区回显泄露。"""
+    text = _PHONE_RE.sub(
+        lambda m: _mask_phone("".join(g for g in m.groups() if g)),
+        str(value or ""),
+    )
+    return text[:limit] if limit is not None else text
+
+
+def _redact_url(url: str) -> str:
+    """日志用 URL：去掉 query / fragment，避免 token、ticket 等参数落盘。"""
+    return str(url or "").split("?", 1)[0].split("#", 1)[0]
+
+
+def _apply_dianshangrong_base(cfg) -> None:
+    """优先使用 config.yaml 的 dianshangrong.base_url，缺失时保留内置常量。"""
+    global DS_BASE, DS_MERCHANT_URL, DS_SMS_URL
+    base = ""
+    try:
+        section = (cfg or {}).get("dianshangrong") or {}
+        if isinstance(section, dict):
+            base = str(section.get("base_url") or "").strip().rstrip("/")
+    except AttributeError:
+        base = ""
+    if not base:
+        return
+    if not re.match(r"^https?://", base):
+        log("⚠️ config.yaml 的 dianshangrong.base_url 不是 http(s) 地址，"
+            f"忽略：{_redact_text(base, 80)}")
+        return
+    DS_BASE = base
+    DS_MERCHANT_URL = DS_BASE + "/incoming-merchant/merchant"
+    DS_SMS_URL = DS_BASE + "/incoming-phoneNumber/phonecardsmsrecord"
+    log(f"电商融地址：{DS_BASE}（来自 config.yaml）")
 
 
 def shot(page, name: str) -> str:
@@ -312,7 +365,7 @@ def ds_goto_merchant_page(page, tries: int = 3) -> None:
                 pass
             if _on_merchant_page(page):
                 return
-        log(f"  不在商户管理页（…{page.url[-35:]}），尝试进入…")
+        log(f"  不在商户管理页（…{_redact_url(page.url)[-35:]}），尝试进入…")
         try:
             page.goto(DS_MERCHANT_URL, wait_until="domcontentloaded")
         except Exception:
@@ -382,12 +435,14 @@ def ds_open_shop_modal(page, shop_name: str) -> str:
         log(f"  ⚠️ 店铺名命中 {rows.count()} 行（可能含固定列重复渲染），取第一行")
     row_text = re.sub(r"\s+", " ", row.text_content() or row.inner_text())
     if shop_name not in row_text:
-        raise RuntimeError(f"命中行异常，请人工核对：{row_text[:80]}")
+        raise RuntimeError(f"命中行异常，请人工核对：{_redact_text(row_text, 80)}")
     # SOP 前提校验：店铺必须处于合作中
     if "店铺合作中" not in row_text:
-        raise RuntimeError(f"店铺状态异常（非「店铺合作中」），暂不能登录导单。行信息：{row_text[:80]}")
+        raise RuntimeError(
+            f"店铺状态异常（非「店铺合作中」），暂不能登录导单。"
+            f"行信息：{_redact_text(row_text, 80)}")
     if "拼多多" not in row_text:
-        log(f"  ⚠️ 该店铺平台标记不是拼多多，仍继续尝试：{row_text[:60]}")
+        log(f"  ⚠️ 该店铺平台标记不是拼多多，仍继续尝试：{_redact_text(row_text, 60)}")
 
     row.get_by_text("编辑", exact=True).first.click()
     page.get_by_text("商户信息", exact=True).first.wait_for(state="visible", timeout=15000)
@@ -460,19 +515,25 @@ def _form_value(page, label: str) -> str:
 
 
 def _dump_form(page) -> None:
-    """把弹窗内所有字段「标签 = 值」打到日志，用于诊断字段差异。"""
+    """把弹窗内所有字段名与值的「长度/掩码」打到日志，用于诊断字段差异。
+
+    绝不输出字段值本身（店铺密码、手机号等），只输出字段名 + 是否有值 + 长度。
+    """
     try:
         rows = page.evaluate(
             """() => Array.from(document.querySelectorAll('.el-form-item'))
                   .map(it => {
                     const l = it.querySelector('.el-form-item__label, label');
+                    const name = (l ? l.textContent.trim() : '?') || '?';
                     const i = it.querySelector('input');
-                    return (l ? l.textContent.trim() : '?') + ' = '
-                           + (i ? (i.value || '(空)') : '(无输入框)');
+                    if (!i) return name + ' = (无输入框)';
+                    const v = i.value || '';
+                    // 脱敏：只报告长度，不输出任何字段值
+                    return name + ' = ' + (v ? '*** (长度' + v.length + ')' : '(空)');
                   })"""
         )
         rows = [r for r in rows if "(无输入框)" not in r]
-        log("  弹窗字段快照：" + " | ".join(rows[:40]))
+        log("  弹窗字段快照（值已脱敏）：" + " | ".join(rows[:40]))
     except Exception as e:
         log(f"  字段快照读取失败：{e}")
 
@@ -490,14 +551,14 @@ def ds_read_credentials(page, wait_s: int = 15) -> tuple[str, str]:
         _dump_form(page)
         shot(page, "credentials_empty")
         raise RuntimeError(
-            f"未能读到有效的店铺主账号手机号（读到 {phone!r}）："
+            f"未能读到有效的店铺主账号手机号（读到 {_mask_phone(phone) or '(空)'}）："
             "可能该店铺资料未录入或字段名不同，见上方字段快照与 debug 截图"
         )
     password = _form_value(page, "店铺密码")
     if not password:
         _dump_form(page)
         raise RuntimeError("店铺密码为空：电商融资料不全，找维护人补录")
-    log(f"  取到主账号手机号 {phone[:3]}****{phone[-4:]} 与店铺密码（长度{len(password)}）✓")
+    log(f"  取到主账号手机号 {_mask_phone(phone)} 与店铺密码（长度{len(password)}）✓")
     return phone, password
 
 
@@ -530,13 +591,14 @@ def ds_close_modal(page) -> None:
 
 def ds_fetch_sms_code(page, phone: str, after: dt.datetime, timeout_s: int) -> str:
     """短信记录页按手机号搜索，轮询抓最新【拼多多】验证码。"""
-    log(f"电商融·短信记录：等待 {phone[:3]}****{phone[-4:]} 的拼多多验证码…")
+    log(f"电商融·短信记录：等待 {_mask_phone(phone)} 的拼多多验证码…")
     page.goto(DS_SMS_URL, wait_until="domcontentloaded")
     page.wait_for_timeout(2000)
-    try:  # 全系统最新短信（不筛选），用于判断接码通道是否整体正常
-        pre = page.locator(".el-table__body tr").first.locator("td").all_inner_texts()
-        if len(pre) >= 3:
-            log(f"  [短信页·全系统最新] {pre[0]} {pre[1]} {pre[2][:30]}")
+    try:  # 全系统最新短信（不筛选），只记条数，用于判断接码通道是否整体正常
+        pre_rows = page.locator(".el-table__body tr")
+        n_pre = pre_rows.count()
+        if n_pre:
+            log(f"  [短信页·全系统] 收到 {n_pre} 条短信（内容已脱敏）")
     except Exception:
         pass
 
@@ -558,7 +620,8 @@ def ds_fetch_sms_code(page, phone: str, after: dt.datetime, timeout_s: int) -> s
             try:
                 fc = rows.first.locator("td").all_inner_texts()
                 if len(fc) >= 3:
-                    log(f"  [短信页·最新] {fc[0]} {fc[1]} {fc[2][:36]}")
+                    log(f"  [短信页·最新] {_mask_phone(fc[0])} {fc[1]} "
+                        f"内容已脱敏（{len(fc[2])} 字）")
             except Exception:
                 pass
         for i in range(min(rows.count(), 30)):
@@ -577,7 +640,7 @@ def ds_fetch_sms_code(page, phone: str, after: dt.datetime, timeout_s: int) -> s
                 continue
             if recv_dt < after:
                 continue  # 旧验证码，不能用
-            log(f"  抓到验证码 {m.group(1)}（短信时间 {recv_time_s}）✓")
+            log(f"  抓到验证码 {_mask_code(m.group(1))}（短信时间 {recv_time_s}）✓")
             return m.group(1)
         page.wait_for_timeout(5000)
     raise RuntimeError(
@@ -675,7 +738,7 @@ def _wait_manual_code(timeout_s: int = 600) -> str | None:
         try:
             t = code_file.read_text(encoding="utf-8").strip()
             if re.fullmatch(r"\d{4,8}", t):
-                log(f"  读取到人工验证码 {t} ✓")
+                log(f"  读取到人工验证码 {_mask_code(t)} ✓")
                 return t
         except Exception:
             pass
@@ -795,7 +858,8 @@ def pdd_ensure_logged_in(ctx, phone: str, password: str, ds_page, cfg, shop_name
                 break
             try:
                 el = probe.get_by_text(re.compile(r"主账号")).first
-                head = re.sub(r"\s+", "", el.inner_text(timeout=3000)) or None
+                head = _redact_text(
+                    re.sub(r"\s+", "", el.inner_text(timeout=3000)), 80) or None
             except Exception:
                 head = None
             if head is None:
@@ -862,7 +926,7 @@ def pdd_login(ctx, phone: str, password: str, ds_page, cfg) -> object:
         shot(page, "pdd_login_page_unknown")
         try:
             body = page.locator("body").inner_text(timeout=3000)
-            log("  [登录页文本] " + re.sub(r"[\s]+", " ", body[:200]))
+            log("  [登录页文本] " + _redact_text(re.sub(r"[\s]+", " ", body), 200))
         except Exception:
             pass
         raise RuntimeError(
@@ -876,7 +940,7 @@ def pdd_login(ctx, phone: str, password: str, ds_page, cfg) -> object:
     # 防浏览器自动填充覆盖：回读核对
     if acc.first.input_value().strip() != phone:
         acc.first.fill(phone)
-    log(f"拼多多：以 {phone[:3]}****{phone[-4:]} 提交登录…")
+    log(f"拼多多：以 {_mask_phone(phone)} 提交登录…")
 
     after = dt.datetime.now() - dt.timedelta(seconds=60)  # 允许 60s 时钟偏差
     page.get_by_role("button", name="登录", exact=True).click()
@@ -889,7 +953,8 @@ def pdd_login(ctx, phone: str, password: str, ds_page, cfg) -> object:
         if _pdd_logged_in(page):
             log("拼多多登录成功 ✓")
             return page
-        state = f"url…{page.url[-45:]} 短信面板={_sms_panel_visible(page)} 滑块={_slider_visible(page)}"
+        state = (f"url…{_redact_url(page.url)[-45:]} "
+                 f"短信面板={_sms_panel_visible(page)} 滑块={_slider_visible(page)}")
         if state != last_state:
             log(f"  [拼多多页面状态] {state}")
             last_state = state
@@ -917,7 +982,8 @@ def pdd_login(ctx, phone: str, password: str, ds_page, cfg) -> object:
                 body = page.locator("body").inner_text(timeout=3000)
                 k = body.find("账号安全")
                 if k >= 0:
-                    log(f"  [验证面板] " + re.sub(r"[\s]+", " ", body[k:k + 130]))
+                    log(f"  [验证面板] " + _redact_text(
+                        re.sub(r"[\s]+", " ", body[k:k + 130]), 130))
             except Exception:
                 pass
             code = None
@@ -1512,23 +1578,11 @@ def pdd_search_orders(page, start_dt, end_dt, manual_dates: bool) -> int:
     raise RuntimeError("未读到「共查询到 N 个订单」结果")
 
 
-def _csv_to_xlsx(csv_path: Path, xlsx_path: Path) -> None:
-    """把平台导出的 CSV 转成真 Excel 表格（openpyxl）。"""
-    import openpyxl
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "订单"
-    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
-        for row in csv.reader(f):
-            ws.append(row)
-    for col_idx, col in enumerate(ws.columns, 1):
-        try:
-            width = max(len(str(c.value or "")) for c in list(col)[:80])
-            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = \
-                min(width + 2, 42)
-        except Exception:
-            pass
-    wb.save(xlsx_path)
+def _safe_filename_part(value: str, fallback: str = "shop") -> str:
+    """把店铺名转成安全的文件名片段：仅保留中英文、数字、下划线和连字符。"""
+    cleaned = re.sub(r"[^\w\u4e00-\u9fa5-]", "_", str(value or ""))
+    cleaned = cleaned.strip("._-")[:80]
+    return cleaned or fallback
 
 
 def pdd_export_and_download(ctx, page, start_dt, end_dt, shop_name: str,
@@ -1596,7 +1650,10 @@ def pdd_export_and_download(ctx, page, start_dt, end_dt, shop_name: str,
     s, e = f"{start_dt:%Y-%m-%d}", f"{end_dt:%Y-%m-%d}"
     log(f"  轮询等待报表生成（时间段 {s} ~ {e}）…")
     deadline = time.time() + timeout_s
-    out = out_dir / f"{shop_name}_{s}_{e}.csv"
+    out_dir = out_dir.resolve()
+    out = (out_dir / f"{_safe_filename_part(shop_name)}_{s}_{e}.csv").resolve()
+    if not out.is_relative_to(out_dir):  # 防御：任何情况下都不允许写出 out_dir
+        raise RuntimeError(f"报表输出路径越界，已拒绝写入：{out}")
     min_gen = (t_click - dt.timedelta(seconds=90)).strftime("%Y-%m-%d %H:%M")
     while time.time() < deadline:
         exp_page.reload(wait_until="domcontentloaded")
@@ -1805,7 +1862,8 @@ def process_shop(ctx, ds_page, shop: dict, sd, ed, cfg, manual_dates: bool) -> d
     try:
         header = page.get_by_text(re.compile(r"主账号")).first.inner_text()
         if name not in header.replace(" ", ""):
-            log(f"  ⚠️ 后台右上角账号信息与店铺名不完全一致，请人工确认：{header[:40]}")
+            log("  ⚠️ 后台右上角账号信息与店铺名不完全一致，请人工确认："
+                f"{_redact_text(header, 40)}")
     except Exception:
         pass
 
@@ -1853,7 +1911,8 @@ def main():
     ap.add_argument("--manual-dates", action="store_true", help="日期选择改为人工在浏览器里点")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8-sig"))
+    _apply_dianshangrong_base(cfg)
     if args.headless:
         cfg["browser"]["headless"] = True
     if args.qr_login:

@@ -14,7 +14,10 @@
 运行：
   python webui.py
 环境变量：
-  PDD_WEB_ACCESS_PASSWORD  可选的站点访问密码；设置后打开网页需先输入
+  PDD_WEB_ACCESS_PASSWORD  可选的站点访问密码；为空时拒绝监听 0.0.0.0
+  PDD_ALLOW_INSECURE_LOCAL 设为 1 时允许无密码启动，但强制只监听 127.0.0.1
+  PDD_WEB_LINK_TOKEN       链接令牌；为空时所有请求返回 503（fail-closed）
+  PDD_PROFILE_TTL_HOURS    浏览器 profile 保留时长（小时，默认 24）
   PDD_SECRET_KEY           服务端加密主密钥；不设置则自动生成 data/secret.key
   PDD_WEB_HOST             监听地址，默认 0.0.0.0
   PDD_WEB_PORT             监听端口，默认 8765
@@ -42,6 +45,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, Response, jsonify, request, send_file, session
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("PDD_WEB_DATA_DIR") or (BASE_DIR / "data")).resolve()
@@ -69,6 +73,9 @@ for d in (DATA_DIR, JOBS_DIR, PROFILES_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
+# 反向代理（nginx / Cloudflare Tunnel）终止 TLS 时，用 X-Forwarded-* 还原
+# 原始协议与主机，否则 request.is_secure 恒为 False，令牌/客户端 Cookie 不会带 Secure。
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
 
 # ---------------------------------------------------------------------------
@@ -338,8 +345,14 @@ def _client_id() -> str:
 
 @app.before_request
 def _require_link_token():
+    # FAIL CLOSED：没有令牌时不再放行任何请求（空令牌 = 任何人都能访问）。
     if not LINK_TOKEN:
-        return None
+        return Response(
+            "服务未配置链接令牌（PDD_WEB_LINK_TOKEN），已拒绝所有请求。"
+            "请检查 data/link_token.txt 或服务环境变量后重启。",
+            status=503,
+            mimetype="text/plain",
+        )
     supplied = request.args.get("token", "")
     if supplied and hmac.compare_digest(supplied, LINK_TOKEN):
         request.environ["pdd_link_token_ok"] = "1"
@@ -763,9 +776,56 @@ def _run_job(job: sqlite3.Row) -> None:
 _LAST_SWEEP = 0.0
 
 
+def _profile_ttl_hours() -> int:
+    """浏览器 profile 的保留时长（小时），默认 24，可用 PDD_PROFILE_TTL_HOURS 覆盖。"""
+    raw = os.environ.get("PDD_PROFILE_TTL_HOURS", "24")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 24
+    return value if value >= 0 else 24
+
+
+def _purge_old_profiles(cutoff_ts: float) -> int:
+    """清理过期且没有未结束任务的浏览器 profile（data/profiles/<client_id>）。"""
+    try:
+        active_clients = set()
+        with DB_LOCK, _db() as con:
+            rows = con.execute(
+                "SELECT DISTINCT client_id FROM jobs WHERE status NOT IN (?,?,?,?)",
+                FINISHED_STATUSES,
+            ).fetchall()
+            active_clients = {r["client_id"] for r in rows}
+    except Exception as exc:
+        print(f"[purge] 读取活动任务失败，跳过 profile 清理: {exc}", flush=True)
+        return 0
+
+    removed = 0
+    try:
+        entries = list(PROFILES_DIR.iterdir())
+    except Exception as exc:
+        print(f"[purge] 读取 profile 目录失败: {exc}", flush=True)
+        return 0
+    for entry in entries:
+        if not entry.is_dir() or not _valid_client_id(entry.name):
+            continue
+        if entry.name in active_clients:
+            continue
+        try:
+            if entry.stat().st_mtime > cutoff_ts:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed += 1
+    return removed
+
+
 def _purge_old_jobs() -> None:
     r"""清除结束超过 24 小时的任务：DB 记录 + 内部文件一起删，防止任务队列无限堆积。
 
+    data/profiles/<client_id> 同样按 PDD_PROFILE_TTL_HOURS（默认 24h）清理，
+    但只删没有未结束任务的 client，避免误删正在排队的浏览器会话。
     E:\order 里的归档副本不受影响（那是给用户长期翻找的）。"""
     cutoff = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     ids = []
@@ -781,8 +841,14 @@ def _purge_old_jobs() -> None:
                 f"DELETE FROM jobs WHERE id IN ({','.join('?' * len(ids))})", ids)
     for jid in ids:
         shutil.rmtree(JOBS_DIR / jid, ignore_errors=True)
-    if ids:
-        print(f"[purge] 已清除 {len(ids)} 个过期任务", flush=True)
+    profile_ttl = _profile_ttl_hours()
+    removed_profiles = (
+        _purge_old_profiles(time.time() - profile_ttl * 3600)
+        if profile_ttl > 0 else 0
+    )
+    if ids or removed_profiles:
+        print(f"[purge] 已清除 {len(ids)} 个过期任务、{removed_profiles} 个过期 profile",
+              flush=True)
 
 
 def _worker_loop() -> None:
@@ -1548,26 +1614,50 @@ def _open_browser() -> None:
     webbrowser.open(f"http://127.0.0.1:{os.environ.get('PDD_WEB_PORT', '8765')}")
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
 def main() -> None:
+    host = (os.environ.get("PDD_WEB_HOST", "0.0.0.0").strip() or "0.0.0.0")
+    port = int(os.environ.get("PDD_WEB_PORT", "8765"))
+    bind_host = host
+    if not LINK_TOKEN:
+        print("[FATAL] PDD_WEB_LINK_TOKEN 为空：链接令牌校验已启用 fail-closed，")
+        print("[FATAL] 所有 HTTP 请求都会返回 503，直到配置 data/link_token.txt")
+        print("[FATAL] 或环境变量 PDD_WEB_LINK_TOKEN 后重启服务。")
+    if ACCESS_PASSWORD:
+        print("  访问密码：      已启用（PDD_WEB_ACCESS_PASSWORD）")
+    else:
+        print("  访问密码：      未启用（PDD_WEB_ACCESS_PASSWORD 为空）")
+        if host.lower() not in LOOPBACK_HOSTS:
+            if not _env_flag("PDD_ALLOW_INSECURE_LOCAL"):
+                print("[FATAL] 未设置访问密码时拒绝监听 0.0.0.0/公网地址。")
+                print("[FATAL] 请设置 PDD_WEB_ACCESS_PASSWORD；仅在明确接受风险时")
+                print("[FATAL] 才可用 PDD_ALLOW_INSECURE_LOCAL=1（将强制仅监听 127.0.0.1）。")
+                raise SystemExit(2)
+            print("[warn] PDD_ALLOW_INSECURE_LOCAL=1：已强制仅监听 127.0.0.1")
+            bind_host = "127.0.0.1"
+
     _init_db()
     _start_worker()
-    host = os.environ.get("PDD_WEB_HOST", "0.0.0.0")
-    port = int(os.environ.get("PDD_WEB_PORT", "8765"))
     if os.environ.get("PDD_OPEN_BROWSER", "1") == "1":
         threading.Thread(target=_open_browser, daemon=True).start()
     print("电商融·拼多多订单导出（服务器版）已启动：")
     print(f"  本机访问：      http://127.0.0.1:{port}")
-    print(f"  局域网同事访问：http://{_lan_ip()}:{port}")
-    if ACCESS_PASSWORD:
-        print("  访问密码：      已启用（PDD_WEB_ACCESS_PASSWORD）")
+    if bind_host.lower() in LOOPBACK_HOSTS:
+        print("  局域网访问：    未开放（仅监听本机）")
     else:
-        print("  访问密码：      未启用，建议在内网服务上设置 PDD_WEB_ACCESS_PASSWORD")
+        print(f"  局域网同事访问：http://{_lan_ip()}:{port}")
     print("Ctrl+C 退出")
     try:
         from waitress import serve
-        serve(app, host=host, port=port, threads=8)
+        serve(app, host=bind_host, port=port, threads=8)
     except ImportError:
-        app.run(host=host, port=port, debug=False, threaded=True)
+        app.run(host=bind_host, port=port, debug=False, threaded=True)
 
 
 if __name__ == "__main__":

@@ -57,10 +57,18 @@ pdd_export.py（Playwright）
 ### 步骤
 
 ```bat
-1. 解压本仓库到 D:\pdd_export_server（路径可改，脚本用相对定位）
+1. 解压本仓库到任意目录（示例 D:\pdd_export_server；脚本按自身位置定位，数据目录为仓库内 data\）
 2. 双击 安装环境.bat   （安装 Python 依赖 + Playwright Chromium）
 3. 双击 启动公网访问.bat（临时公网地址试用）
 ```
+
+`run_webui.cmd` 中的 `PDD_WEB_DATA_DIR` 固定为 `%~dp0data`（即仓库目录下的 `data\`），
+与 `start_public.ps1`、`webui.py` 的默认值一致，不再写死具体盘符。
+
+> 注意：`webui.py` 在 `PDD_WEB_ACCESS_PASSWORD` 为空时拒绝监听 `0.0.0.0`。
+> 生产部署请先设置访问密码；token-only 部署需显式设置
+> `PDD_ALLOW_INSECURE_LOCAL=1`（仅监听 `127.0.0.1`，Cloudflare / SSH 隧道仍可接入），
+> 否则服务会以明确的 FATAL 信息退出。
 
 生产建议（固定域名、开机自启、令牌保护、自动归档）见 `运维手册.md`
 （随部署包附带，包含完整架构与故障排查表）。
@@ -92,6 +100,17 @@ start/stop_public.ps1  上述 .bat 对应的实现脚本
 
 ## 安全说明
 
-- `data/`（令牌、任务库、浏览器会话）**不入库**，已列入 `.gitignore`
+- **链接令牌 fail-closed**：`PDD_WEB_LINK_TOKEN` 为空时不再放行请求，所有请求返回
+  503；`run_webui.cmd` 在启动前也会直接拒绝启动
+- **无密码不监听公网**：`PDD_WEB_ACCESS_PASSWORD` 为空时，`webui.py` 拒绝在
+  `0.0.0.0` 等非回环地址监听并退出。仅当显式设置 `PDD_ALLOW_INSECURE_LOCAL=1`
+  时才允许无密码启动，且强制只监听 `127.0.0.1`（Cloudflare / SSH 隧道仍可接入）
+- **反向代理**：已启用 `ProxyFix`，nginx / Cloudflare 终止 TLS 时能正确识别
+  `X-Forwarded-Proto`，令牌/客户端 Cookie 的 `Secure` 判定恢复正常
+- **日志脱敏**：日志不输出店铺密码、手机号全号、短信内容、验证码全码；
+  字段快照只记录字段名与长度
+- `data/`（令牌、任务库、浏览器会话）**不入库**，已列入 `.gitignore`；
+  任务目录保留 24h，`data/profiles/<client_id>` 默认同样保留 24h
+  （可用 `PDD_PROFILE_TTL_HOURS` 覆盖）
 - 请勿在公共场合泄露 `data/link_token.txt`；泄露后删除该文件并重启服务即可轮换
 - 电商融密码仅在勾选「同时记住密码」时加密保存，且只对提交任务的那个浏览器可见
