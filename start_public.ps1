@@ -69,10 +69,13 @@ for ($i = 0; $i -lt 20; $i++) {
     Start-Sleep -Milliseconds 500
     if ($Web.HasExited) { break }
     try {
-        $localUrl = "$BaseUrl/?token=$Token"
-        $r = Invoke-WebRequest -UseBasicParsing -Uri $localUrl -TimeoutSec 2
-        if ($r.StatusCode -eq 200) { $webReady = $true; break }
-    } catch {}
+        # 不带 token 探测：服务已监听时必然返回 404（未授权）；只有连接失败才无响应。
+        $null = Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/" -TimeoutSec 2 -ErrorAction Stop
+        $webReady = $true
+        break
+    } catch {
+        if ($_.Exception.Response) { $webReady = $true; break }
+    }
 }
 if (-not $webReady) {
     if (-not $Web.HasExited) { Stop-Process -Id $Web.Id -Force -ErrorAction SilentlyContinue }
@@ -111,17 +114,27 @@ if (-not $PublicBase) {
     throw "Cloudflare tunnel failed to start.`n$details"
 }
 
-$PublicUrl = "$PublicBase/?token=$Token"
+# 只落盘不含 token 的基础地址：带 token 的完整 URL 一旦被转发/同步到网盘
+# 就等于长期有效的钥匙。首次访问所需的 token 单独保存在 data/link_token.txt。
 Set-Content -LiteralPath (Join-Path $Data 'public_url.txt') -Value $PublicBase -Encoding ASCII
-Set-Content -LiteralPath (Join-Path $Data 'public_access_url.txt') -Value $PublicUrl -Encoding ASCII
+$AccessHint = @(
+    $PublicBase,
+    '',
+    '首次访问：在上面的地址后附加一次 ?token=<令牌>（令牌见 data/link_token.txt）',
+    '浏览器会换取 HttpOnly Cookie 并跳转到不带 token 的地址，之后直接打开基础地址即可。',
+    '请不要把带 token 的链接转发给他人。'
+) -join [Environment]::NewLine
+Set-Content -LiteralPath (Join-Path $Data 'public_access_url.txt') -Value $AccessHint -Encoding UTF8
 
 Write-Host ''
 Write-Host '============================================================' -ForegroundColor Green
 Write-Host 'Public access is running.' -ForegroundColor Green
 Write-Host ''
-Write-Host $PublicUrl -ForegroundColor Cyan
+Write-Host $PublicBase -ForegroundColor Cyan
 Write-Host ''
-Write-Host 'Send this full link, including ?token=...' -ForegroundColor Yellow
+Write-Host 'First visit: append ?token=<link token> once (token: data\link_token.txt).' -ForegroundColor Yellow
+Write-Host 'The browser then stores an HttpOnly cookie and drops the token from the URL.' -ForegroundColor Yellow
+Write-Host 'Do NOT forward the tokenized link. Share only the base URL above.' -ForegroundColor Yellow
 Write-Host 'Keep this computer powered on and connected to the Internet.' -ForegroundColor Yellow
 Write-Host '============================================================' -ForegroundColor Green
 Write-Host ''

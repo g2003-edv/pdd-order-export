@@ -2,9 +2,10 @@
 1. 解压到 D:\pdd_export_server，不要直接放在桌面。
 2. 双击“安装环境.bat”，等待 Python 依赖和浏览器内核安装完成。
 3. 双击“启动公网访问.bat”。
-4. 窗口中会显示一条 https://....trycloudflare.com/?token=... 地址。
-5. 把完整地址发给同事，同事在任何网络直接打开，不需要安装软件，也不需要输入密码。
-6. 需要停止时，双击“停止服务.bat”。
+4. 窗口中会显示一条 https://....trycloudflare.com/ 基础地址（不再包含 token）。
+5. 首次访问时在地址后附加一次 ?token=<data\link_token.txt 中的令牌>。
+   浏览器会换取 HttpOnly Cookie 并跳转到不带 token 的地址，之后把基础地址发给同事即可。
+6. 不要把带 token 的链接转发给他人；需要停止时，双击“停止服务.bat”。
 
 要求
 - Windows 10/11 或 Windows Server，已安装 Python 3.10+。

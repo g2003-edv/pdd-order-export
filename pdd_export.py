@@ -28,6 +28,7 @@
 import argparse
 import datetime as dt
 import json
+import logging
 import os
 import re
 import subprocess
@@ -41,6 +42,11 @@ from playwright.sync_api import (
     sync_playwright,
     TimeoutError as PWTimeout,
 )
+
+try:
+    import psutil
+except ImportError:  # 未安装 psutil 时只能按记录的 PID 清理浏览器
+    psutil = None
 
 BASE_DIR = Path(__file__).resolve().parent
 DEBUG_DIR = Path(os.environ.get("PDD_DEBUG_DIR") or (BASE_DIR / "debug")).resolve()
@@ -59,6 +65,17 @@ MAX_BACKOFF_DAYS = 92  # 拼多多限制：可查时间窗 ≤ 3 个月（留 2 
 
 def log(msg: str) -> None:
     print(f"[{dt.datetime.now():%H:%M:%S}] {msg}", flush=True)
+
+
+logger = logging.getLogger("pdd_export")
+if not logger.handlers:
+    _log_handler = logging.StreamHandler()
+    _log_handler.setFormatter(
+        logging.Formatter("[%(asctime)s] WARN %(message)s", datefmt="%H:%M:%S")
+    )
+    logger.addHandler(_log_handler)
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False
 
 
 _PHONE_RE = re.compile(r"(?<!\d)(1[3-9]\d)[ -]?(\d{4})[ -]?(\d{4})(?!\d)")
@@ -314,8 +331,8 @@ def _ds_auto_login(page, account: str, password: str) -> None:
         try:
             if page.get_by_text("商户管理", exact=False).count() > 0:
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("登录态检测失败: %s", type(e).__name__)
         slider_up = page.locator(".verify-move-block:visible").count() > 0
         if slider_up and not slider_note:
             slider_note = True   # 只提示一次，避免刷屏
@@ -498,8 +515,8 @@ def _form_value(page, label: str) -> str:
             v = _scan(dlg.first)
             if v:
                 return v
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("店铺资料弹窗扫描失败: %s", type(e).__name__)
     # 其次：全页扫（空字段自动跳过）
     v = _scan(page)
     if v:
@@ -599,8 +616,8 @@ def ds_fetch_sms_code(page, phone: str, after: dt.datetime, timeout_s: int) -> s
         n_pre = pre_rows.count()
         if n_pre:
             log(f"  [短信页·全系统] 收到 {n_pre} 条短信（内容已脱敏）")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("短信页行数探测失败: %s", type(e).__name__)
 
     box = page.get_by_placeholder("请输入手机号")
     box.click()
@@ -612,8 +629,8 @@ def ds_fetch_sms_code(page, phone: str, after: dt.datetime, timeout_s: int) -> s
         poll += 1
         try:
             page.get_by_role("button", name="搜索", exact=True).click()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("短信页搜索点击失败: %s", type(e).__name__)
         page.wait_for_timeout(2500)
         rows = page.locator(".el-table__body tr")
         if poll % 3 == 1 and rows.count() > 0:  # 定期打印最新一条，便于判断短信是否进系统
@@ -622,8 +639,8 @@ def ds_fetch_sms_code(page, phone: str, after: dt.datetime, timeout_s: int) -> s
                 if len(fc) >= 3:
                     log(f"  [短信页·最新] {_mask_phone(fc[0])} {fc[1]} "
                         f"内容已脱敏（{len(fc[2])} 字）")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("短信页最新记录读取失败: %s", type(e).__name__)
         for i in range(min(rows.count(), 30)):
             cells = rows.nth(i).locator("td").all_inner_texts()
             if len(cells) < 3:
@@ -762,8 +779,8 @@ def _write_session_shop(name: str) -> None:
     try:
         DEBUG_DIR.mkdir(exist_ok=True)
         SESSION_SHOP_FILE.write_text(name, encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("写入会话店铺标记失败: %s", type(e).__name__)
 
 
 def _cdp_port() -> int:
@@ -795,6 +812,24 @@ def _find_real_browser(cfg) -> str | None:
     return None
 
 
+def _chrome_pid_path() -> Path:
+    """本任务浏览器的 PID 记录文件：优先任务目录（webui 会设置对应环境变量）。"""
+    raw = os.environ.get("PDD_CHROME_PID_FILE", "").strip()
+    if raw:
+        return Path(raw).resolve()
+    return (DEBUG_DIR / "chrome.pid").resolve()
+
+
+def _record_chrome_pid(pid: int) -> None:
+    try:
+        path = _chrome_pid_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(pid), encoding="ascii")
+        log(f"  已记录浏览器 PID {pid}（{path}）")
+    except OSError as e:
+        logger.warning("记录浏览器 PID 失败: %s", type(e).__name__)
+
+
 def pdd_cdp_browser(pw, cfg):
     """连接（必要时拉起）真实 Chrome/Edge 的 CDP 调试口，返回 Browser。
 
@@ -820,12 +855,13 @@ def pdd_cdp_browser(pw, cfg):
     prof_path.mkdir(parents=True, exist_ok=True)
     prof = str(prof_path)
     log(f"调试口未开，正在拉起真实浏览器 {Path(exe).name}（端口 {port}，profile={prof}）…")
-    subprocess.Popen(
+    proc = subprocess.Popen(
         [exe, f"--remote-debugging-port={port}", f"--user-data-dir={prof}",
          "--no-first-run", "--no-default-browser-check", "--window-size=1400,920",
          "about:blank"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+    _record_chrome_pid(proc.pid)
     deadline = time.time() + 40
     while time.time() < deadline:
         try:
@@ -919,16 +955,16 @@ def pdd_login(ctx, phone: str, password: str, ds_page, cfg) -> object:
         try:
             page.get_by_text("账号登录", exact=True).first.click(timeout=6000)
             page.wait_for_timeout(1500)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("切换到账号登录页签失败: %s", type(e).__name__)
         acc = page.locator("input[placeholder*='账号名']:visible")
     if acc.count() == 0:
         shot(page, "pdd_login_page_unknown")
         try:
             body = page.locator("body").inner_text(timeout=3000)
             log("  [登录页文本] " + _redact_text(re.sub(r"[\s]+", " ", body), 200))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("读取登录页文本失败: %s", type(e).__name__)
         raise RuntimeError(
             "拼多多登录页未见账密输入框：可能触发滑块/风控提示或页面改版，"
             "见 debug 截图与上方登录页文本"
@@ -976,16 +1012,16 @@ def pdd_login(ctx, phone: str, password: str, ds_page, cfg) -> object:
                             after = dt.datetime.now()
                             page.wait_for_timeout(1500)
                             break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("点击获取验证码失败: %s", type(e).__name__)
             try:  # 打印面板文字，便于诊断
                 body = page.locator("body").inner_text(timeout=3000)
                 k = body.find("账号安全")
                 if k >= 0:
                     log(f"  [验证面板] " + _redact_text(
                         re.sub(r"[\s]+", " ", body[k:k + 130]), 130))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("读取验证面板文本失败: %s", type(e).__name__)
             code = None
             send_clicks = 1   # 面板倒计时代表平台已发过第 1 次
             max_sends = 2     # 平台对验证码有频控：最多再主动重发 1 次，避免烧配额
@@ -1003,8 +1039,8 @@ def pdd_login(ctx, phone: str, password: str, ds_page, cfg) -> object:
                                     after = dt.datetime.now()
                                     page.wait_for_timeout(2000)
                                     break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("重发验证码点击失败: %s", type(e).__name__)
                 try:
                     code = ds_fetch_sms_code(ds_page, phone, after, 25)
                 except RuntimeError:
@@ -1620,8 +1656,8 @@ def pdd_export_and_download(ctx, page, start_dt, end_dt, shop_name: str,
         if probe:
             try:
                 probe.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("关闭报表预检页失败: %s", type(e).__name__)
 
     t_click = dt.datetime.now()  # 报表时间只精确到分钟，比对时另行放宽 90s
     page.get_by_role("button", name="批量导出", exact=True).click()
@@ -1631,8 +1667,8 @@ def pdd_export_and_download(ctx, page, start_dt, end_dt, shop_name: str,
     try:
         page.get_by_text("自定义报表", exact=True).first.click(timeout=3000)
         page.wait_for_timeout(500)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("选择自定义报表失败（继续尝试生成）: %s", type(e).__name__)
 
     exp_page = None
     try:
@@ -1734,8 +1770,8 @@ def pdd_export_and_download(ctx, page, start_dt, end_dt, shop_name: str,
         log(f"  报表已下载：{out}（{size/1024:.0f} KB）✓")
         try:
             exp_page.close()  # 报表标签页用完即关，避免标签越积越多
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("关闭报表标签页失败: %s", type(e).__name__)
         return out
     shot(exp_page, "report_timeout")
     raise RuntimeError(f"{timeout_s}s 内报表未生成（注意平台限制：两次导出需间隔 5 分钟以上）")
@@ -1811,22 +1847,106 @@ def resolve_dates(cfg, args):
     return sd, ed
 
 
+_BROWSER_NAMES = ("chrome.exe", "msedge.exe")
+
+
+def _norm_profile(value: str) -> str:
+    raw = (value or "").strip().strip('"')
+    if not raw:
+        return ""
+    return os.path.normcase(os.path.normpath(raw))
+
+
+def _pid_is_profile_browser(proc, profile_dir: Path) -> bool:
+    """进程是 Chrome/Edge，且命令行里的 --user-data-dir= 精确等于本任务 profile。"""
+    try:
+        if (proc.name() or "").lower() not in _BROWSER_NAMES:
+            return False
+        cmdline = proc.cmdline()
+    except psutil.Error:
+        return False
+    target = _norm_profile(str(profile_dir))
+    if not target:
+        return False
+    for arg in cmdline:
+        arg = (arg or "").strip().strip('"')
+        if not arg.lower().startswith("--user-data-dir="):
+            continue
+        if _norm_profile(arg.split("=", 1)[1]) == target:
+            return True
+    return False
+
+
+def _kill_process_tree(proc) -> None:
+    try:
+        procs = proc.children(recursive=True)
+    except psutil.Error:
+        procs = []
+    procs.append(proc)
+    for p in procs:
+        try:
+            p.kill()
+        except psutil.Error:
+            pass
+
+
 def _kill_leftover_chrome(profile_dir: Path) -> None:
     """任务结束后关掉本任务拉起的真实浏览器，避免任务栏窗口越积越多。
 
+    优先按启动时记录到任务目录的 PID 终止；PID 缺失/失效/不匹配时，
+    用 psutil 按 --user-data-dir 绝对路径精确匹配兜底。不再拼接
+    PowerShell 命令行，也不再按 profile 名做子串模糊匹配（会误杀）。
     登录会话保存在 profile 磁盘文件里，关掉浏览器不影响下次免登录
     （下次任务会重新拉起并直接复用会话）。"""
+    profile_dir = profile_dir.resolve()
+    pid_file = _chrome_pid_path()
+    if psutil is None:
+        logger.warning("清理遗留浏览器跳过：未安装 psutil（pip install psutil）")
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+        return
+
+    killed = 0
     try:
-        pat = str(profile_dir).replace("'", "''")
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
-             "Where-Object { $_.CommandLine -like '*" + pat + "*' } | "
-             "ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
-             "-ErrorAction SilentlyContinue }"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=40)
-    except Exception:
+        pid_raw = pid_file.read_text(encoding="ascii").strip()
+    except OSError:
+        pid_raw = ""
+
+    if pid_raw.isdigit():
+        pid = int(pid_raw)
+        try:
+            proc = psutil.Process(pid)
+            if _pid_is_profile_browser(proc, profile_dir):
+                _kill_process_tree(proc)
+                killed += 1
+                log(f"  已按 PID {pid} 关闭本任务浏览器")
+            else:
+                logger.warning("PID %s 不是本任务浏览器，跳过 PID 终止", pid)
+        except psutil.NoSuchProcess:
+            pass  # 浏览器已退出（或启动进程已交接给已有实例），走 profile 兜底
+        except psutil.Error as e:
+            logger.warning("按 PID %s 关闭浏览器失败: %s", pid, type(e).__name__)
+
+    if not killed:
+        try:
+            for proc in psutil.process_iter(["name"]):
+                try:
+                    if _pid_is_profile_browser(proc, profile_dir):
+                        _kill_process_tree(proc)
+                        killed += 1
+                except psutil.Error:
+                    continue
+        except psutil.Error as e:
+            logger.warning("遍历进程清理浏览器失败: %s", type(e).__name__)
+
+    try:
+        pid_file.unlink()
+    except OSError:
         pass
+    if killed:
+        log(f"  已关闭 {killed} 个使用本任务 profile 的浏览器进程")
 
 
 def _clear_tabs_keep_browser(ctx) -> None:
@@ -1923,6 +2043,11 @@ def main():
         os.environ["PDD_CDP_PROFILE_DIR"] = str(Path(args.cdp_profile_dir).resolve())
     if args.cdp_port:
         os.environ["PDD_CDP_PORT"] = str(args.cdp_port)
+    if args.job_dir:
+        # 浏览器 PID 落到任务目录，收尾时优先按 PID 精确终止
+        os.environ["PDD_CHROME_PID_FILE"] = str(
+            (Path(args.job_dir) / "chrome.pid").resolve()
+        )
     creds = {
         "account": args.ds_account or os.environ.get("DS_ACCOUNT", ""),
         "password": args.ds_password or os.environ.get("DS_PASSWORD", ""),

@@ -70,6 +70,20 @@ pdd_export.py（Playwright）
 > `PDD_ALLOW_INSECURE_LOCAL=1`（仅监听 `127.0.0.1`，Cloudflare / SSH 隧道仍可接入），
 > 否则服务会以明确的 FATAL 信息退出。
 
+### 访问方式（token 只用于首次换取 Cookie）
+
+1. `start_public.ps1` / `启动公网访问.bat` 只打印**不含 token 的基础地址**
+   `https://xxx.trycloudflare.com/`，并写入 `data/public_url.txt` 与
+   `data/public_access_url.txt`（仅基础地址 + 说明，不含令牌）。
+2. 首次访问时在地址后附加一次 `?token=<data/link_token.txt 中的令牌>`。
+3. 服务校验通过后设置 `HttpOnly` + `SameSite=Lax`（HTTPS 时 `Secure`）的会话 Cookie，
+   并 302 跳转到去掉 query 的同一路径。之后直接打开基础地址即可，令牌不再留在
+   地址栏、浏览器历史、书签或 Referer 中。
+4. Cookie 有效期由 `PDD_WEB_LINK_COOKIE_DAYS` 控制，默认 **7 天**（原为 365 天）。
+   `?token=` 仍然兼容，但只用于换取 Cookie，不再作为长期入口。
+5. 请只转发基础地址；带 token 的链接泄露后，对方也能换取 Cookie。发生泄露时删除
+   `data/link_token.txt` 并重启服务即可轮换令牌（所有已发 Cookie 同时失效）。
+
 生产建议（固定域名、开机自启、令牌保护、自动归档）见 `运维手册.md`
 （随部署包附带，包含完整架构与故障排查表）。
 
@@ -102,6 +116,14 @@ start/stop_public.ps1  上述 .bat 对应的实现脚本
 
 - **链接令牌 fail-closed**：`PDD_WEB_LINK_TOKEN` 为空时不再放行请求，所有请求返回
   503；`run_webui.cmd` 在启动前也会直接拒绝启动
+- **令牌不长期留在 URL**：`?token=` 仅用于首次访问换取 `HttpOnly` + `SameSite=Lax`
+  （HTTPS 时 `Secure`）Cookie，随后 302 跳转到不带 token 的地址；后续请求优先认
+  Cookie。有效期由 `PDD_WEB_LINK_COOKIE_DAYS` 控制，默认 7 天
+- **start_public 不落盘令牌**：`data/public_url.txt` / `data/public_access_url.txt`
+  只写基础地址和首次访问提示，不再包含完整 `?token=` URL
+- **隧道主机密钥**：`tunnel_to_server.cmd` 使用 `StrictHostKeyChecking=accept-new`，
+  首次连接后主机密钥固定在用户 `known_hosts`，后续变更会被拒绝；连接失败最多尝试
+  10 次（含首次，5s 起、60s 封顶），`YOUR_SERVER_IP` 未替换时直接退出
 - **无密码不监听公网**：`PDD_WEB_ACCESS_PASSWORD` 为空时，`webui.py` 拒绝在
   `0.0.0.0` 等非回环地址监听并退出。仅当显式设置 `PDD_ALLOW_INSECURE_LOCAL=1`
   时才允许无密码启动，且强制只监听 `127.0.0.1`（Cloudflare / SSH 隧道仍可接入）

@@ -17,6 +17,7 @@
   PDD_WEB_ACCESS_PASSWORD  可选的站点访问密码；为空时拒绝监听 0.0.0.0
   PDD_ALLOW_INSECURE_LOCAL 设为 1 时允许无密码启动，但强制只监听 127.0.0.1
   PDD_WEB_LINK_TOKEN       链接令牌；为空时所有请求返回 503（fail-closed）
+  PDD_WEB_LINK_COOKIE_DAYS 首次访问换取 Cookie 的有效天数，默认 7
   PDD_PROFILE_TTL_HOURS    浏览器 profile 保留时长（小时，默认 24）
   PDD_SECRET_KEY           服务端加密主密钥；不设置则自动生成 data/secret.key
   PDD_WEB_HOST             监听地址，默认 0.0.0.0
@@ -42,9 +43,10 @@ import webbrowser
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlencode
 
 from cryptography.fernet import Fernet, InvalidToken
-from flask import Flask, Response, jsonify, request, send_file, session
+from flask import Flask, Response, jsonify, redirect, request, send_file, session
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -62,6 +64,23 @@ FINISHED_STATUSES = ("已完成", "部分失败", "失败", "已取消")
 ACCESS_PASSWORD = os.environ.get("PDD_WEB_ACCESS_PASSWORD", "")
 LINK_TOKEN = os.environ.get("PDD_WEB_LINK_TOKEN", "").strip()
 LINK_TOKEN_COOKIE = "pdd_link_token"
+
+
+def _link_cookie_max_age() -> int:
+    """链接令牌 Cookie 有效期（秒）：环境变量可配，默认 7 天，上限 365 天。"""
+    raw = os.environ.get("PDD_WEB_LINK_COOKIE_DAYS", "").strip()
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        days = 7
+    if days <= 0:
+        days = 7
+    return min(days, 365) * 24 * 3600
+
+
+LINK_COOKIE_MAX_AGE = _link_cookie_max_age()
+# 客户端身份 Cookie 用于记住该浏览器保存的账号，保持原有 365 天，不受令牌 Cookie 配置影响。
+CLIENT_COOKIE_MAX_AGE = 365 * 24 * 3600
 WORKER_WAKE = threading.Event()
 DB_LOCK = threading.RLock()
 RUNNING_LOCK = threading.RLock()
@@ -343,6 +362,13 @@ def _client_id() -> str:
     return value
 
 
+def _url_without_token() -> str:
+    """当前请求去掉 ?token= 后的相对地址（保留其它查询参数）。"""
+    pairs = [(k, v) for k, v in request.args.items(multi=True) if k != "token"]
+    query = urlencode(pairs)
+    return request.path + (f"?{query}" if query else "")
+
+
 @app.before_request
 def _require_link_token():
     # FAIL CLOSED：没有令牌时不再放行任何请求（空令牌 = 任何人都能访问）。
@@ -353,24 +379,30 @@ def _require_link_token():
             status=503,
             mimetype="text/plain",
         )
+    # 优先认 Cookie：首次访问用 ?token= 换到 HttpOnly Cookie 后，
+    # 地址栏里不再需要（也不应该）长期携带令牌。
+    cookie = request.cookies.get(LINK_TOKEN_COOKIE, "")
+    if cookie and hmac.compare_digest(cookie, LINK_TOKEN):
+        return None
     supplied = request.args.get("token", "")
     if supplied and hmac.compare_digest(supplied, LINK_TOKEN):
         request.environ["pdd_link_token_ok"] = "1"
-        return None
-    cookie = request.cookies.get(LINK_TOKEN_COOKIE, "")
-    if cookie and hmac.compare_digest(cookie, LINK_TOKEN):
+        if request.method in ("GET", "HEAD"):
+            # 302 到去掉 token 的同一路径；after_request 会在这条响应上种 Cookie。
+            # 令牌因此不会留在浏览器历史、书签和 Referer 里。
+            return redirect(_url_without_token(), code=302)
+        # 非 GET（如直接带 token 调 API）：本次放行并种 Cookie，不做重定向。
         return None
     return Response("Not found", status=404, mimetype="text/plain")
 
 
 @app.after_request
 def _persist_client_cookie(response):
-    value = request.environ.get("pdd_new_client_id")
     if request.environ.get("pdd_link_token_ok"):
         response.set_cookie(
             LINK_TOKEN_COOKIE,
             LINK_TOKEN,
-            max_age=365 * 24 * 3600,
+            max_age=LINK_COOKIE_MAX_AGE,
             httponly=True,
             samesite="Lax",
             secure=request.is_secure,
@@ -380,7 +412,7 @@ def _persist_client_cookie(response):
         response.set_cookie(
             CLIENT_COOKIE,
             value,
-            max_age=365 * 24 * 3600,
+            max_age=CLIENT_COOKIE_MAX_AGE,
             httponly=True,
             samesite="Lax",
             secure=request.is_secure,
